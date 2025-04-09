@@ -46,6 +46,9 @@ async def verify(ic_image: UploadFile = File(...), selfie_image: UploadFile = Fi
         emb2 = get_embedding(selfie_face)
 
         similarity = cosine_similarity(emb1, emb2)
-        return {"similarity": similarity, "match": similarity > 0.5}
+        return {
+            "similarity": similarity,
+            "match": similarity > 0.5  # Adjust threshold as needed
+        }
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
