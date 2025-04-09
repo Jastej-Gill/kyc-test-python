@@ -1,10 +1,8 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-numpy==1.24.4
-opencv-python
-pillow
-scikit-learn
+fastapi
+uvicorn[standard]
 tensorflow==2.10.0
-python-multipart
+numpy
+pillow
+opencv-python
 easyocr
-
+python-multipart
