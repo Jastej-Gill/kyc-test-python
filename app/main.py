@@ -3,7 +3,7 @@ from fastapi.responses import JSONResponse
 from typing import List
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageOps, ExifTags
 from tensorflow.lite.python.interpreter import Interpreter
 import os
 import uuid
@@ -15,19 +15,32 @@ import shutil
 app = FastAPI()
 
 # Load FaceNet TFLite model
+print("[INFO] Loading FaceNet model...")
 interpreter = Interpreter(model_path="models/facenet.tflite")
 interpreter.allocate_tensors()
 input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
+print("[INFO] Model loaded successfully.")
 
 INPUT_SIZE = 160  # FaceNet input size
 SAVE_DIR = "detected_faces"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+print("[INFO] Initializing EasyOCR reader...")
 reader = easyocr.Reader(['en', 'ms'])  # EasyOCR for Malay IC
+print("[INFO] EasyOCR reader ready.")
+
+def correct_image_rotation(image: Image.Image) -> Image.Image:
+    try:
+        return ImageOps.exif_transpose(image)
+    except Exception as e:
+        print(f"[WARN] Rotation correction skipped: {e}")
+        return image
 
 def preprocess_image(image_bytes, label: str) -> tuple[np.ndarray, str]:
-    image = Image.open(image_bytes).convert('RGB')
+    print(f"[INFO] Preprocessing image for label: {label}")
+    raw_image = Image.open(image_bytes).convert('RGB')
+    image = correct_image_rotation(raw_image)
     image_np = np.array(image)
 
     gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
@@ -35,20 +48,29 @@ def preprocess_image(image_bytes, label: str) -> tuple[np.ndarray, str]:
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
 
     if len(faces) == 0:
+        print("[WARN] No face detected.")
         raise Exception("No face detected in the image")
+
+    # For IC, ignore very small faces (e.g., watermark image)
+    if label == "ic":
+        faces = [f for f in faces if f[2] * f[3] > 10000]  # area > 10,000 px
+        if len(faces) == 0:
+            print("[WARN] Only watermark or small face detected on IC.")
+            raise Exception("No valid main face detected on IC image")
 
     x, y, w, h = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
     face_img = image_np[y:y+h, x:x+w]
 
-    # Save image with bounding box
     cv2.rectangle(image_np, (x, y), (x + w, y + h), (0, 255, 0), 2)
     filename = f"detected_{label}_{uuid.uuid4().hex[:8]}.jpg"
     save_path = os.path.join(SAVE_DIR, filename)
     cv2.imwrite(save_path, cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
+    print(f"[INFO] Saved annotated image to {save_path}")
 
     face_resized = cv2.resize(face_img, (INPUT_SIZE, INPUT_SIZE))
     normalized = (face_resized.astype(np.float32) - 127.5) / 128.0
     return np.expand_dims(normalized, axis=0), save_path
+
 
 def get_embedding(image_tensor: np.ndarray) -> np.ndarray:
     interpreter.set_tensor(input_details[0]['index'], image_tensor)
@@ -65,6 +87,7 @@ def cosine_similarity(a, b):
 @app.post("/verify/")
 async def verify(ic_image: UploadFile = File(...), selfie_image: UploadFile = File(...)):
     try:
+        print("[INFO] Starting face verification...")
         ic_face, ic_path = preprocess_image(ic_image.file, "ic")
         selfie_face, selfie_path = preprocess_image(selfie_image.file, "selfie")
 
@@ -72,6 +95,7 @@ async def verify(ic_image: UploadFile = File(...), selfie_image: UploadFile = Fi
         emb2 = get_embedding(selfie_face)
 
         similarity = cosine_similarity(emb1, emb2)
+        print(f"[INFO] Similarity: {similarity}")
 
         return {
             "success": True,
@@ -87,6 +111,7 @@ async def verify(ic_image: UploadFile = File(...), selfie_image: UploadFile = Fi
         }
 
     except Exception as e:
+        print(f"[ERROR] Verification failed: {e}")
         return JSONResponse(status_code=500, content={
             "success": False,
             "message": "Verification failed.",
@@ -96,12 +121,15 @@ async def verify(ic_image: UploadFile = File(...), selfie_image: UploadFile = Fi
 @app.post("/extract_ic_text/")
 async def extract_ic_text(ic_image: UploadFile = File(...)):
     try:
-        image = Image.open(ic_image.file).convert("RGB")
+        print("[INFO] Starting IC text extraction...")
+        raw_image = Image.open(ic_image.file).convert("RGB")
+        image = correct_image_rotation(raw_image)
         image_np = np.array(image)
 
         results = reader.readtext(image_np)
         lines = [res[1].strip() for res in results if res[1].strip()]
         full_text = "\n".join(lines)
+        print(f"[DEBUG] OCR Lines: {lines}")
 
         ic_number = None
         ic_index = -1
@@ -119,6 +147,8 @@ async def extract_ic_text(ic_image: UploadFile = File(...)):
         address_lines = lines[address_start:address_start + 3]
         address = "\n".join(address_lines).strip()
 
+        print(f"[INFO] IC Number: {ic_number}, Name: {name}, Address: {address}")
+
         return {
             "success": True,
             "message": "IC text extracted successfully.",
@@ -131,11 +161,13 @@ async def extract_ic_text(ic_image: UploadFile = File(...)):
         }
 
     except Exception as e:
+        print(f"[ERROR] IC Text Extraction Failed: {e}")
         return JSONResponse(status_code=500, content={
             "success": False,
             "message": "Failed to extract IC text.",
             "error": str(e)
         })
+
 
 @app.post("/verify_liveness/")
 async def verify_liveness(
@@ -143,6 +175,7 @@ async def verify_liveness(
     selfie_images: List[UploadFile] = File(...)
 ):
     try:
+        print("[INFO] Starting liveness check...")
         ic_face, _ = preprocess_image(ic_image.file, label="ic")
         ic_embedding = get_embedding(ic_face)
 
@@ -159,6 +192,7 @@ async def verify_liveness(
                 faces = face_cascade.detectMultiScale(gray, 1.1, 5)
 
                 if len(faces) == 0:
+                    print("[WARN] No face detected in one of the selfie frames.")
                     continue
 
                 x, y, w, h = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
@@ -172,10 +206,12 @@ async def verify_liveness(
                 emb = get_embedding(input_tensor)
                 selfie_embeddings.append(emb)
 
-            except Exception:
+            except Exception as frame_err:
+                print(f"[ERROR] Frame processing failed: {frame_err}")
                 continue
 
         if len(selfie_embeddings) < 2:
+            print("[ERROR] Not enough valid selfie frames.")
             return {
                 "success": False,
                 "message": "Not enough valid selfie frames with detected faces.",
@@ -192,6 +228,8 @@ async def verify_liveness(
         similarity = cosine_similarity(ic_embedding, avg_selfie_emb)
         match = similarity > 0.5
 
+        print(f"[INFO] Liveness passed: {movement}, Similarity: {similarity}, Match: {match}")
+
         return {
             "success": True,
             "message": "Liveness and match verification completed.",
@@ -204,6 +242,7 @@ async def verify_liveness(
         }
 
     except Exception as e:
+        print(f"[ERROR] Liveness verification failed: {e}")
         return JSONResponse(status_code=500, content={
             "success": False,
             "message": "Liveness verification failed.",
