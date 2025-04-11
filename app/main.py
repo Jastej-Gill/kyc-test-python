@@ -84,7 +84,11 @@ def cosine_similarity(a, b):
     norm_b = np.linalg.norm(b)
     return float(dot / (norm_a * norm_b))
 
-def verify_ic_structure_orb(image_np: np.ndarray, threshold: float = 15.0) -> bool:
+def verify_ic_structure_orb(image_np: np.ndarray, threshold: float = 15.0, use_template=False) -> bool:
+    if not use_template:
+        print("[INFO] Skipping template matching — generic ID mode.")
+        return True
+
     template_path = "templates/ic_template.jpg"
     if not os.path.exists(template_path):
         print("[WARN] IC template not found — skipping ORB matching")
@@ -124,11 +128,11 @@ async def verify_ic_structure(ic_image: UploadFile = File(...)):
         raw_ic = Image.open(ic_image.file).convert("RGB")
         image_np = np.array(correct_image_rotation(raw_ic))
 
-        if not verify_ic_structure_orb(image_np):
-            raise Exception("Uploaded image does not match the structure of a Malaysian MyKad.")
+        if not verify_ic_structure_orb(image_np, use_template=False):
+            raise Exception("Uploaded image does not match the expected ID layout.")
 
         lines = extract_text_from_ic(image_np)
-        has_text = any(re.search(r'[A-Z]{2,}|\d{6,}', line) for line in lines)
+        has_text = len(lines) >= 3
         if not has_text:
             raise Exception("IC image does not appear to contain valid text content.")
 
