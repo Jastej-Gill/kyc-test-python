@@ -19,8 +19,6 @@ This backend powers the Flutter eKYC app, providing:
 - virtualenv (recommended)
 
 ## 🔧 Setup
-
-```bash
 python -m venv venv
 source venv/bin/activate   # or venv\Scripts\activate on Windows
 
