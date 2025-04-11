@@ -124,26 +124,57 @@ def verify_ic_structure_orb(image_np: np.ndarray, threshold: float = 15.0, use_t
 @app.post("/verify_ic_structure/")
 async def verify_ic_structure(ic_image: UploadFile = File(...)):
     try:
-        print("[INFO] Verifying IC structure only...")
-        raw_ic = Image.open(ic_image.file).convert("RGB")
-        image_np = np.array(correct_image_rotation(raw_ic))
+        print("[INFO] Verifying ID structure and face presence...")
 
-        if not verify_ic_structure_orb(image_np, use_template=False):
+        # Step 1: Load and auto-correct orientation
+        raw_ic = Image.open(ic_image.file).convert("RGB")
+        image = correct_image_rotation(raw_ic)
+        image_np = np.array(image)
+
+        # Step 2: Face detection (must have at least one face)
+        def detect_face(image_np: np.ndarray) -> bool:
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+            face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+            print(f"[INFO] Detected {len(faces)} face(s)")
+            return len(faces) > 0
+
+        if not detect_face(image_np):
+            raise Exception("No face detected in the uploaded ID image.")
+
+        # Step 3: Optional ORB template match (MyKad only)
+        if not verify_ic_structure_orb(image_np, use_template=False):  # set to True for MyKad-specific check
             raise Exception("Uploaded image does not match the expected ID layout.")
 
+        # Step 4: OCR text check
         lines = extract_text_from_ic(image_np)
-        has_text = len(lines) >= 3
-        if not has_text:
-            raise Exception("IC image does not appear to contain valid text content.")
+        if len(lines) < 3:
+            raise Exception("Image does not contain enough readable text to be considered an ID.")
 
-        return {"success": True, "message": "IC structure and text presence validated."}
+        # Optional keyword validation (optional and customizable)
+        keywords = ["passport", "license", "id", "permit", "kad", "nombor", "nama", "name"]
+        keyword_hits = any(any(word in line.lower() for word in keywords) for line in lines)
+
+        if not keyword_hits:
+            print("[WARN] No strong ID-related keywords found, but continuing since text exists.")
+
+        return {
+            "success": True,
+            "message": "ID structure and facial presence validated.",
+            "data": {
+                "face_detected": True,
+                "text_lines_detected": len(lines),
+                "sample_text": lines[:5]
+            }
+        }
 
     except Exception as e:
-        print(f"[ERROR] IC structure verification failed: {e}")
+        print(f"[ERROR] ID structure verification failed: {e}")
         return JSONResponse(status_code=400, content={
             "success": False,
             "message": str(e)
         })
+
     
 # Utility: Rotate image based on EXIF orientation
 def auto_rotate_image(pil_img: Image.Image) -> Image.Image:
