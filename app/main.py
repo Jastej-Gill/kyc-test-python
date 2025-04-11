@@ -1,14 +1,17 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
+from datetime import datetime
 from typing import List
 import numpy as np
 import cv2
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ExifTags
+from io import BytesIO
 from tensorflow.lite.python.interpreter import Interpreter
 import os
 import uuid
 import easyocr
 import re
+from datetime import datetime
 
 app = FastAPI()
 
@@ -20,7 +23,7 @@ input_details = interpreter.get_input_details()
 output_details = interpreter.get_output_details()
 print("[INFO] Model loaded successfully.")
 
-INPUT_SIZE = 160  # FaceNet input size
+INPUT_SIZE = 160
 SAVE_DIR = "detected_faces"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
@@ -124,7 +127,6 @@ async def verify_ic_structure(ic_image: UploadFile = File(...)):
         if not verify_ic_structure_orb(image_np):
             raise Exception("Uploaded image does not match the structure of a Malaysian MyKad.")
 
-        # OCR-based discard check
         lines = extract_text_from_ic(image_np)
         has_text = any(re.search(r'[A-Z]{2,}|\d{6,}', line) for line in lines)
         if not has_text:
@@ -138,48 +140,39 @@ async def verify_ic_structure(ic_image: UploadFile = File(...)):
             "success": False,
             "message": str(e)
         })
-
-@app.post("/verify_face_match/")
-async def verify_face_match(ic_image: UploadFile = File(...), selfie_image: UploadFile = File(...)):
+    
+# Utility: Rotate image based on EXIF orientation
+def auto_rotate_image(pil_img: Image.Image) -> Image.Image:
     try:
-        print("[INFO] Verifying face match between IC and selfie...")
-        ic_face, ic_path = preprocess_image(ic_image.file, "ic")
-        selfie_face, selfie_path = preprocess_image(selfie_image.file, "selfie")
+        exif = pil_img._getexif()
+        if exif:
+            orientation_key = next(
+                k for k, v in ExifTags.TAGS.items() if v == 'Orientation'
+            )
+            orientation = exif.get(orientation_key)
 
-        if ic_face is None or selfie_face is None:
-            raise Exception("Face not detected in one of the images.")
-
-        emb1 = get_embedding(ic_face)
-        emb2 = get_embedding(selfie_face)
-
-        similarity = cosine_similarity(emb1, emb2)
-        print(f"[INFO] Similarity: {similarity}")
-
-        return {
-            "success": True,
-            "message": "Face verification complete.",
-            "data": {
-                "similarity": similarity,
-                "match": similarity > 0.5,
-                "saved_files": {
-                    "ic_image_with_box": ic_path,
-                    "selfie_image_with_box": selfie_path
-                }
-            }
-        }
-
+            if orientation == 3:
+                pil_img = pil_img.rotate(180, expand=True)
+            elif orientation == 6:
+                pil_img = pil_img.rotate(270, expand=True)
+            elif orientation == 8:
+                pil_img = pil_img.rotate(90, expand=True)
     except Exception as e:
-        print(f"[ERROR] Face match verification failed: {e}")
-        return JSONResponse(status_code=500, content={
-            "success": False,
-            "message": "Face match verification failed.",
-            "error": str(e)
-        })
+        print(f"[WARN] EXIF rotation skipped: {e}")
+    return pil_img
 
-@app.post("/verify_liveness/")
-async def verify_liveness(ic_image: UploadFile = File(...), selfie_images: List[UploadFile] = File(...)):
+@app.post("/verify_liveness_and_match/")
+async def verify_liveness_and_match(
+    ic_image: UploadFile = File(...),
+    selfie_images: List[UploadFile] = File(...)
+):
     try:
-        print("[INFO] Starting liveness check...")
+        print("[INFO] Starting liveness + face match check...")
+
+        if len(selfie_images) != 5:
+            raise Exception("Exactly 5 selfie frames are required.")
+
+        # Step 1: Process IC image
         ic_face, _ = preprocess_image(ic_image.file, label="ic")
         if ic_face is None:
             raise Exception("No face detected in IC image.")
@@ -187,62 +180,101 @@ async def verify_liveness(ic_image: UploadFile = File(...), selfie_images: List[
 
         selfie_embeddings = []
         face_boxes = []
+        eye_ratios = []
 
-        for selfie in selfie_images:
+        save_dir = "debug_selfie_frames"
+        os.makedirs(save_dir, exist_ok=True)
+
+        for i, selfie in enumerate(selfie_images):
             try:
-                image = Image.open(selfie.file).convert("RGB")
+                selfie_bytes = await selfie.read()
+                selfie.file.seek(0)
+
+                print(f"[DEBUG] Selfie frame {i+1}: {len(selfie_bytes)} bytes")
+                if len(selfie_bytes) < 1000:
+                    print(f"[WARN] Selfie frame {i+1} might be empty or corrupted.")
+
+                # Open + auto-rotate
+                image = Image.open(BytesIO(selfie_bytes))
+                image = auto_rotate_image(image)
+                image = image.convert("RGB")
+
+                # Save debug frame
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                debug_path = os.path.join(save_dir, f"frame_{i+1}_{timestamp}.jpg")
+                image.save(debug_path)
+                print(f"[DEBUG] Saved selfie frame to {debug_path}")
+
+                # Face detection
                 image_np = np.array(image)
                 gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-                face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+                face_cascade = cv2.CascadeClassifier(
+                    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+                )
                 faces = face_cascade.detectMultiScale(gray, 1.1, 5)
 
                 if len(faces) == 0:
                     print("[WARN] No face detected in one of the selfie frames.")
                     continue
 
+                # Crop + debug
                 x, y, w, h = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
                 face_boxes.append((x, y))
                 face_crop = image_np[y:y+h, x:x+w]
+                face_debug_path = os.path.join(save_dir, f"face_{i+1}_{timestamp}.jpg")
+                Image.fromarray(face_crop).save(face_debug_path)
+
+                # Embedding
                 face_resized = cv2.resize(face_crop, (160, 160))
                 normalized = (face_resized.astype(np.float32) - 127.5) / 128.0
                 input_tensor = np.expand_dims(normalized, axis=0)
                 emb = get_embedding(input_tensor)
                 selfie_embeddings.append(emb)
 
-            except Exception as frame_err:
-                print(f"[ERROR] Frame processing failed: {frame_err}")
+                eye_ratios.append(w / h)
+
+            except Exception as e:
+                print(f"[ERROR] Frame {i+1} failed: {e}")
                 continue
 
         if len(selfie_embeddings) < 2:
             raise Exception("At least 2 valid selfie frames required.")
 
+        # Step 2: Check Liveness (movement or eye ratio changes)
         movement = any(
             abs(face_boxes[i][0] - face_boxes[i-1][0]) > 5 or
             abs(face_boxes[i][1] - face_boxes[i-1][1]) > 5
             for i in range(1, len(face_boxes))
         )
+        eye_changes = any(
+            abs(eye_ratios[i] - eye_ratios[i - 1]) > 0.05
+            for i in range(1, len(eye_ratios))
+        )
+        liveness = movement or eye_changes
 
+        # Step 3: Face Match with IC
         avg_selfie_emb = np.mean(np.array(selfie_embeddings), axis=0)
         similarity = cosine_similarity(ic_embedding, avg_selfie_emb)
         match = similarity > 0.5
 
-        print(f"[INFO] Liveness passed: {movement}, Similarity: {similarity}, Match: {match}")
+        print(f"[INFO] Match: {match}, Liveness: {liveness}, Similarity: {similarity}")
 
         return {
             "success": True,
-            "message": "Liveness and match verification completed.",
+            "message": "Liveness and face match verification completed.",
             "data": {
-                "similarity": similarity,
+                "liveness_passed": liveness,
                 "match": match,
-                "liveness_passed": movement,
+                "similarity": similarity,
                 "frames_processed": len(selfie_embeddings)
             }
         }
 
     except Exception as e:
-        print(f"[ERROR] Liveness verification failed: {e}")
+        print(f"[ERROR] Combined verification failed: {e}")
         return JSONResponse(status_code=500, content={
             "success": False,
-            "message": "Liveness verification failed.",
+            "message": "Liveness and match verification failed.",
             "error": str(e)
         })
+
