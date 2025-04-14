@@ -1,7 +1,7 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse
 from datetime import datetime
-from typing import List
+from typing import List, Optional, Tuple
 import numpy as np
 import cv2
 from PIL import Image, ImageOps, ExifTags
@@ -45,7 +45,7 @@ def extract_text_from_ic(image_np: np.ndarray) -> List[str]:
     print(f"[DEBUG] OCR lines: {lines}")
     return lines
 
-def preprocess_image(image_bytes, label: str) -> tuple[np.ndarray | None, str | None]:
+def preprocess_image(image_bytes, label: str) -> Tuple[Optional[np.ndarray], Optional[str]]:
     print(f"[INFO] Preprocessing image for label: {label}")
     raw_image = Image.open(image_bytes).convert('RGB')
     image = correct_image_rotation(raw_image)
