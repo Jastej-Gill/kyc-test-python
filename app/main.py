@@ -141,7 +141,7 @@ async def verify_ic_structure(ic_image: UploadFile = File(...)):
         match_result = find_best_template_match(image_np)
         print(f"[INFO] Best match: {match_result['type']} (ORB: {match_result['orb_score']}, SSIM: {match_result['ssim_score']:.2f})")
 
-        if match_result["orb_score"] < 35 or match_result["ssim_score"] < 0.25:
+        if match_result["orb_score"] < 35 or match_result["ssim_score"] < 0.5:
             raise Exception("Uploaded image does not match any known ID layout.")
 
         lines = extract_text_from_ic(image_np)
