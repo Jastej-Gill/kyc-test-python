@@ -12,6 +12,7 @@ import uuid
 import easyocr
 import re
 from datetime import datetime
+from skimage.metrics import structural_similarity as ssim
 
 app = FastAPI()
 
@@ -24,8 +25,6 @@ output_details = interpreter.get_output_details()
 print("[INFO] Model loaded successfully.")
 
 INPUT_SIZE = 160
-SAVE_DIR = "detected_faces"
-os.makedirs(SAVE_DIR, exist_ok=True)
 
 print("[INFO] Initializing EasyOCR reader...")
 reader = easyocr.Reader(['en', 'ms'])
@@ -62,15 +61,9 @@ def preprocess_image(image_bytes, label: str) -> Tuple[Optional[np.ndarray], Opt
     x, y, w, h = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
     face_img = image_np[y:y+h, x:x+w]
 
-    filename = f"detected_{label}_{uuid.uuid4().hex[:8]}.jpg"
-    save_path = os.path.join(SAVE_DIR, filename)
-    cv2.rectangle(image_np, (x, y), (x + w, y + h), (0, 255, 0), 2)
-    cv2.imwrite(save_path, cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR))
-    print(f"[INFO] Saved annotated image to {save_path}")
-
     face_resized = cv2.resize(face_img, (INPUT_SIZE, INPUT_SIZE))
     normalized = (face_resized.astype(np.float32) - 127.5) / 128.0
-    return np.expand_dims(normalized, axis=0), save_path
+    return np.expand_dims(normalized, axis=0), None
 
 def get_embedding(image_tensor: np.ndarray) -> np.ndarray:
     interpreter.set_tensor(input_details[0]['index'], image_tensor)
@@ -84,54 +77,57 @@ def cosine_similarity(a, b):
     norm_b = np.linalg.norm(b)
     return float(dot / (norm_a * norm_b))
 
-def verify_ic_structure_orb(image_np: np.ndarray, threshold: float = 15.0, use_template=False) -> bool:
-    if not use_template:
-        print("[INFO] Skipping template matching — generic ID mode.")
-        return True
+def find_best_template_match(image_np: np.ndarray, threshold: int = 30) -> dict:
+    TEMPLATES = {
+        "malaysia_ic": "templates/malaysia_ic_template.png",
+        "malaysia_license": "templates/malaysia_licence_template.png",
+        "passport": "templates/passport_template.jpg",
+        "universal_id": "templates/universal_id_template.jpg",
+        "universal_license": "templates/universal_licence_template.jpg"
+    }
 
-    template_path = "templates/ic_template.jpg"
-    if not os.path.exists(template_path):
-        print("[WARN] IC template not found — skipping ORB matching")
-        return True
+    results = []
 
-    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
-    if template is None:
-        raise Exception("Failed to load IC template image.")
+    for doc_type, path in TEMPLATES.items():
+        if not os.path.exists(path):
+            continue
 
-    gray_input = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
-    orb = cv2.ORB_create(nfeatures=500)
-    kp1, des1 = orb.detectAndCompute(template, None)
-    kp2, des2 = orb.detectAndCompute(gray_input, None)
+        template = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        gray_input = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
 
-    if des1 is None or des2 is None:
-        print("[WARN] No descriptors found in template or input image.")
-        return False
+        resized_input = cv2.resize(gray_input, (600, 400))
+        resized_template = cv2.resize(template, (600, 400))
 
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    matches = bf.match(des1, des2)
-    good_matches = [m for m in matches if m.distance < 60]
-    match_score = len(good_matches)
+        orb = cv2.ORB_create(nfeatures=500)
+        kp1, des1 = orb.detectAndCompute(resized_template, None)
+        kp2, des2 = orb.detectAndCompute(resized_input, None)
 
-    print(f"[INFO] ORB match count: {match_score}")
+        orb_score = 0
+        if des1 is not None and des2 is not None:
+            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            matches = bf.match(des1, des2)
+            good_matches = [m for m in matches if m.distance < 60]
+            orb_score = len(good_matches)
 
-    vis_path = "debug_orb_matches.jpg"
-    match_vis = cv2.drawMatches(template, kp1, gray_input, kp2, good_matches[:30], None, flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS)
-    cv2.imwrite(vis_path, match_vis)
-    print(f"[INFO] Saved ORB match visualization to {vis_path}")
+        ssim_score = ssim(resized_template, resized_input)
 
-    return match_score >= threshold
+        results.append({
+            "type": doc_type,
+            "orb_score": orb_score,
+            "ssim_score": ssim_score
+        })
+
+    best = sorted(results, key=lambda r: (r["orb_score"], r["ssim_score"]), reverse=True)[0]
+    return best
 
 @app.post("/verify_ic_structure/")
 async def verify_ic_structure(ic_image: UploadFile = File(...)):
     try:
         print("[INFO] Verifying ID structure and face presence...")
-
-        # Step 1: Load and auto-correct orientation
         raw_ic = Image.open(ic_image.file).convert("RGB")
         image = correct_image_rotation(raw_ic)
         image_np = np.array(image)
 
-        # Step 2: Face detection (must have at least one face)
         def detect_face(image_np: np.ndarray) -> bool:
             gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
             face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -142,16 +138,16 @@ async def verify_ic_structure(ic_image: UploadFile = File(...)):
         if not detect_face(image_np):
             raise Exception("No face detected in the uploaded ID image.")
 
-        # Step 3: Optional ORB template match (MyKad only)
-        if not verify_ic_structure_orb(image_np, use_template=False):  # set to True for MyKad-specific check
-            raise Exception("Uploaded image does not match the expected ID layout.")
+        match_result = find_best_template_match(image_np)
+        print(f"[INFO] Best match: {match_result['type']} (ORB: {match_result['orb_score']}, SSIM: {match_result['ssim_score']:.2f})")
 
-        # Step 4: OCR text check
+        if match_result["orb_score"] < 50 or match_result["ssim_score"] < 0.25:
+            raise Exception("Uploaded image does not match any known ID layout.")
+
         lines = extract_text_from_ic(image_np)
         if len(lines) < 3:
             raise Exception("Image does not contain enough readable text to be considered an ID.")
 
-        # Optional keyword validation (optional and customizable)
         keywords = ["passport", "license", "id", "permit", "kad", "nombor", "nama", "name"]
         keyword_hits = any(any(word in line.lower() for word in keywords) for line in lines)
 
@@ -164,7 +160,10 @@ async def verify_ic_structure(ic_image: UploadFile = File(...)):
             "data": {
                 "face_detected": True,
                 "text_lines_detected": len(lines),
-                "sample_text": lines[:5]
+                "sample_text": lines[:5],
+                "detected_document_type": match_result["type"],
+                "orb_match_score": match_result["orb_score"],
+                "ssim_score": round(match_result["ssim_score"], 3)
             }
         }
 
@@ -175,8 +174,7 @@ async def verify_ic_structure(ic_image: UploadFile = File(...)):
             "message": str(e)
         })
 
-    
-# Utility: Rotate image based on EXIF orientation
+
 def auto_rotate_image(pil_img: Image.Image) -> Image.Image:
     try:
         exif = pil_img._getexif()
@@ -207,7 +205,6 @@ async def verify_liveness_and_match(
         if len(selfie_images) != 5:
             raise Exception("Exactly 5 selfie frames are required.")
 
-        # Step 1: Process IC image
         ic_face, _ = preprocess_image(ic_image.file, label="ic")
         if ic_face is None:
             raise Exception("No face detected in IC image.")
@@ -216,9 +213,6 @@ async def verify_liveness_and_match(
         selfie_embeddings = []
         face_boxes = []
         eye_ratios = []
-
-        save_dir = "debug_selfie_frames"
-        os.makedirs(save_dir, exist_ok=True)
 
         for i, selfie in enumerate(selfie_images):
             try:
@@ -229,18 +223,10 @@ async def verify_liveness_and_match(
                 if len(selfie_bytes) < 1000:
                     print(f"[WARN] Selfie frame {i+1} might be empty or corrupted.")
 
-                # Open + auto-rotate
                 image = Image.open(BytesIO(selfie_bytes))
                 image = auto_rotate_image(image)
                 image = image.convert("RGB")
 
-                # Save debug frame
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                debug_path = os.path.join(save_dir, f"frame_{i+1}_{timestamp}.jpg")
-                image.save(debug_path)
-                print(f"[DEBUG] Saved selfie frame to {debug_path}")
-
-                # Face detection
                 image_np = np.array(image)
                 gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
                 face_cascade = cv2.CascadeClassifier(
@@ -252,14 +238,10 @@ async def verify_liveness_and_match(
                     print("[WARN] No face detected in one of the selfie frames.")
                     continue
 
-                # Crop + debug
                 x, y, w, h = sorted(faces, key=lambda f: f[2]*f[3], reverse=True)[0]
                 face_boxes.append((x, y))
                 face_crop = image_np[y:y+h, x:x+w]
-                face_debug_path = os.path.join(save_dir, f"face_{i+1}_{timestamp}.jpg")
-                Image.fromarray(face_crop).save(face_debug_path)
 
-                # Embedding
                 face_resized = cv2.resize(face_crop, (160, 160))
                 normalized = (face_resized.astype(np.float32) - 127.5) / 128.0
                 input_tensor = np.expand_dims(normalized, axis=0)
@@ -275,7 +257,6 @@ async def verify_liveness_and_match(
         if len(selfie_embeddings) < 2:
             raise Exception("At least 2 valid selfie frames required.")
 
-        # Step 2: Check Liveness (movement or eye ratio changes)
         movement = any(
             abs(face_boxes[i][0] - face_boxes[i-1][0]) > 5 or
             abs(face_boxes[i][1] - face_boxes[i-1][1]) > 5
@@ -287,7 +268,6 @@ async def verify_liveness_and_match(
         )
         liveness = movement or eye_changes
 
-        # Step 3: Face Match with IC
         avg_selfie_emb = np.mean(np.array(selfie_embeddings), axis=0)
         similarity = cosine_similarity(ic_embedding, avg_selfie_emb)
         match = similarity > 0.5
@@ -312,4 +292,3 @@ async def verify_liveness_and_match(
             "message": "Liveness and match verification failed.",
             "error": str(e)
         })
-

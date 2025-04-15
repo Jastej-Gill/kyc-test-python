@@ -6,6 +6,7 @@ __pycache__/
 # Virtual environment
 venv/
 venv310/
+venv310new/
 detected_faces/
 
 # VS Code settings

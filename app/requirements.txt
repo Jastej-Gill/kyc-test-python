@@ -1,8 +1,9 @@
 fastapi
 uvicorn[standard]
 tensorflow==2.10.0
-numpy<2
-pillow
-opencv-python
+numpy>=1.21,<2.0
+pillow>=8.0
+opencv-python>=4.5
 easyocr
 python-multipart
+scikit-image>=0.18
